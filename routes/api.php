@@ -16,6 +16,15 @@ use App\Http\Controllers\AdminController;
 |--------------------------------------------------------------------------
 */
 
+// Health check endpoint
+Route::get('/health', function () {
+    return response()->json([
+        'status' => 'ok',
+        'timestamp' => now(),
+        'environment' => app()->environment(),
+    ]);
+});
+
 // Public routes
 Route::post('/register', [AuthController::class, 'register']);
 Route::post('/login', [AuthController::class, 'login']);
