@@ -1,7 +1,10 @@
 name: 🚀 Deploy to EC2
 
 on:
-  push:
+  workflow_run:
+    workflows: ["🧪 CI - Test & Build"]
+    types:
+      - completed
     branches: [ main, master ]
   workflow_dispatch:
     inputs:
@@ -10,9 +13,33 @@ on:
         required: false
         default: 'false'
         type: boolean
+      skip_ci_check:
+        description: 'Skip CI check (use with caution)'
+        required: false
+        default: 'false'
+        type: boolean
 
 jobs:
+  check-ci:
+    if: github.event_name == 'workflow_run'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+    - name: ✅ Check CI Status
+      run: |
+        if [ "${{ github.event.workflow_run.conclusion }}" != "success" ]; then
+          echo "❌ CI tests failed. Deployment cancelled."
+          echo "📋 CI Workflow: ${{ github.event.workflow_run.html_url }}"
+          exit 1
+        fi
+        echo "✅ CI tests passed. Proceeding with deployment."
+        echo "📋 CI Workflow: ${{ github.event.workflow_run.html_url }}"
+
   check-secrets:
+    needs: [check-ci]
+    if: always() && (needs.check-ci.result == 'success' || (needs.check-ci.result == 'skipped' && (github.event_name == 'workflow_dispatch' || github.event.inputs.skip_ci_check == 'true')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
@@ -73,8 +100,8 @@ jobs:
         fi
 
   setup:
-    needs: check-secrets
-    if: github.event.inputs.setup_new == 'true'
+    needs: [check-secrets]
+    if: always() && needs.check-secrets.result == 'success' && github.event.inputs.setup_new == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     
