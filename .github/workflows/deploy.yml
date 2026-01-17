@@ -1,17 +1,93 @@
-name: Deploy to AWS EC2
+name: 🚀 Deploy to EC2
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, master ]
   workflow_dispatch:
+    inputs:
+      setup_new:
+        description: 'First time EC2 setup?'
+        required: false
+        default: 'false'
+        type: boolean
 
 jobs:
-  deploy:
+  check-secrets:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 2
+    steps:
+    - name: 🔍 Validate GitHub Secrets
+      run: |
+        echo "🔍 Checking GitHub Secrets..."
+        
+        MISSING_SECRETS=()
+        
+        if [ -z "${{ secrets.EC2_HOST }}" ]; then
+          MISSING_SECRETS+=("EC2_HOST")
+        fi
+        
+        if [ -z "${{ secrets.EC2_USER }}" ]; then
+          MISSING_SECRETS+=("EC2_USER")
+        fi
+        
+        if [ -z "${{ secrets.SSH_PRIVATE_KEY }}" ]; then
+          MISSING_SECRETS+=("SSH_PRIVATE_KEY")
+        fi
+        
+        if [ ${#MISSING_SECRETS[@]} -eq 0 ]; then
+          echo "✅ All required secrets are configured!"
+          echo "✅ EC2_HOST: ${{ secrets.EC2_HOST }}"
+          echo "✅ EC2_USER: ${{ secrets.EC2_USER }}"
+          echo "✅ EC2_PORT: ${{ secrets.EC2_PORT || '22 (default)' }}"
+          echo "✅ SSH_PRIVATE_KEY: [Configured]"
+        else
+          echo "❌ Missing required secrets: ${MISSING_SECRETS[*]}"
+          echo ""
+          echo "📝 Quick Setup Instructions:"
+          echo ""
+          echo "### Method 1: GitHub CLI (Recommended)"
+          echo "\`\`\`bash"
+          echo "# Install GitHub CLI (if not installed)"
+          echo "gh auth login"
+          echo ""
+          echo "# Add secrets"
+          echo "gh secret set EC2_HOST --body '13.203.154.21'"
+          echo "gh secret set EC2_USER --body 'ubuntu'"
+          echo "gh secret set EC2_PORT --body '22'"
+          echo "gh secret set SSH_PRIVATE_KEY < ~/your-key.pem"
+          echo "\`\`\`"
+          echo ""
+          echo "### Method 2: GitHub Web UI"
+          echo "1. Go to: Settings → Secrets and variables → Actions"
+          echo "2. Click 'New repository secret'"
+          echo "3. Add each secret:"
+          echo "   - EC2_HOST: Your EC2 IP address"
+          echo "   - EC2_USER: ubuntu (or your EC2 username)"
+          echo "   - EC2_PORT: 22 (or your SSH port)"
+          echo "   - SSH_PRIVATE_KEY: Complete content of your .pem file"
+          echo ""
+          echo "### Verify Secrets"
+          echo "After adding, verify with: gh secret list"
+          echo ""
+          exit 1
+        fi
+
+  setup:
+    needs: check-secrets
+    if: github.event.inputs.setup_new == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     
     steps:
-    - name: Deploy to EC2
+    - name: 🐛 Debug - Setup Info
+      run: |
+        echo "🔍 Setup Debug Info:"
+        echo "EC2 Host: ${{ secrets.EC2_HOST }}"
+        echo "EC2 User: ${{ secrets.EC2_USER }}"
+        echo "EC2 Port: ${{ secrets.EC2_PORT || 22 }}"
+        echo "Repo URL: ${{ secrets.REPO_URL || 'Not set' }}"
+    
+    - name: 🔧 Setup EC2 Instance (First Time)
       uses: appleboy/ssh-action@v1.0.3
       with:
         host: ${{ secrets.EC2_HOST }}
@@ -19,9 +95,255 @@ jobs:
         key: ${{ secrets.SSH_PRIVATE_KEY }}
         port: ${{ secrets.EC2_PORT || 22 }}
         script: |
+          set -e
+          set -x  # Enable debug mode
+          echo "🔧 Setting up EC2 instance..."
+          echo "📋 System Info:"
+          uname -a
+          whoami
+          pwd
+          
+          # Install Docker
+          if ! command -v docker &> /dev/null; then
+            echo "📦 Installing Docker..."
+            curl -fsSL https://get.docker.com -o get-docker.sh
+            sudo sh get-docker.sh 2>&1 | tee docker-install.log
+            sudo usermod -aG docker ${{ secrets.EC2_USER }}
+            echo "✅ Docker installed"
+            docker --version
+          else
+            echo "✅ Docker already installed: $(docker --version)"
+          fi
+          
+          # Install Docker Compose
+          if ! command -v docker-compose &> /dev/null; then
+            echo "📦 Installing Docker Compose..."
+            sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+            sudo chmod +x /usr/local/bin/docker-compose
+            echo "✅ Docker Compose installed"
+            docker-compose --version
+          else
+            echo "✅ Docker Compose already installed: $(docker-compose --version)"
+          fi
+          
+          # Create directory
+          echo "📁 Creating directories..."
+          sudo mkdir -p /var/www/pharmacy-backend
+          sudo chown ${{ secrets.EC2_USER }}:${{ secrets.EC2_USER }} /var/www/pharmacy-backend
           cd /var/www/pharmacy-backend
-          git pull origin main || git pull origin master
-          docker-compose down
-          docker-compose up -d --build
-          docker-compose exec -T app php artisan migrate --force || true
-          docker-compose exec -T app php artisan config:clear cache:clear route:clear || true
+          echo "✅ Directory created: $(pwd)"
+          
+          # Clone repo if not exists
+          if [ ! -d ".git" ]; then
+            echo "📥 Cloning repository..."
+            git clone ${{ secrets.REPO_URL || 'https://github.com/YOUR_USERNAME/pharmacy-backend.git' }} . 2>&1 | tee clone.log
+            echo "✅ Repository cloned"
+          else
+            echo "✅ Repository already exists"
+            git remote -v
+          fi
+          
+          # Setup .env
+          if [ ! -f .env ]; then
+            echo "⚙️  Setting up .env..."
+            cp .env.example .env || echo "⚠️ .env.example not found"
+            EC2_IP=${{ secrets.EC2_HOST }}
+            sed -i "s|APP_URL=.*|APP_URL=http://$EC2_IP:8000|g" .env
+            sed -i "s|APP_ENV=.*|APP_ENV=production|g" .env
+            sed -i "s|APP_DEBUG=.*|APP_DEBUG=false|g" .env
+            echo "✅ .env file created"
+            cat .env | grep -E "(APP_URL|APP_ENV|APP_DEBUG)" || echo "⚠️ .env check"
+          else
+            echo "✅ .env file already exists"
+          fi
+          
+          # Create network
+          docker network create pharmacy-network || echo "⚠️ Network may already exist"
+          docker network ls | grep pharmacy-network || echo "⚠️ Network check"
+          
+          echo "✅ EC2 setup complete!"
+
+  deploy:
+    needs: [check-secrets, setup]
+    if: always() && needs.check-secrets.result == 'success' && (needs.setup.result == 'success' || needs.setup.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    steps:
+    - name: 📥 Checkout Code
+      uses: actions/checkout@v4
+    
+    - name: 🐛 Debug - Deployment Info
+      run: |
+        echo "🔍 Deployment Debug Info:"
+        echo "Branch: ${{ github.ref }}"
+        echo "Commit: ${{ github.sha }}"
+        echo "Author: ${{ github.actor }}"
+        echo "EC2 Host: ${{ secrets.EC2_HOST }}"
+    
+    - name: 🚀 Deploy to EC2
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.EC2_HOST }}
+        username: ${{ secrets.EC2_USER }}
+        key: ${{ secrets.SSH_PRIVATE_KEY }}
+        port: ${{ secrets.EC2_PORT || 22 }}
+        script: |
+          set -e
+          set -x  # Enable debug mode
+          echo "🚀 Starting deployment..."
+          echo "📋 Pre-deployment checks:"
+          pwd
+          whoami
+          docker --version
+          docker-compose --version
+          
+          # Ensure directory exists
+          sudo mkdir -p /var/www/pharmacy-backend
+          sudo chown ${{ secrets.EC2_USER }}:${{ secrets.EC2_USER }} /var/www/pharmacy-backend
+          cd /var/www/pharmacy-backend
+          echo "✅ Working directory: $(pwd)"
+          
+          # Clone if not exists
+          if [ ! -d ".git" ]; then
+            echo "📥 Cloning repository..."
+            git clone ${{ secrets.REPO_URL || 'https://github.com/YOUR_USERNAME/pharmacy-backend.git' }} .
+          fi
+          
+          # Pull latest code
+          echo "📥 Pulling latest code..."
+          git fetch origin 2>&1 | tee fetch.log
+          git reset --hard origin/main || git reset --hard origin/master
+          echo "✅ Code updated"
+          git log -1 --oneline
+          
+          # Ensure .env exists
+          if [ ! -f .env ]; then
+            echo "⚠️ .env not found, creating..."
+            cp .env.example .env || echo "⚠️ .env.example not found"
+            EC2_IP=${{ secrets.EC2_HOST }}
+            sed -i "s|APP_URL=.*|APP_URL=http://$EC2_IP:8000|g" .env
+            sed -i "s|APP_ENV=.*|APP_ENV=production|g" .env
+            sed -i "s|APP_DEBUG=.*|APP_DEBUG=false|g" .env
+          fi
+          echo "✅ .env file ready"
+          
+          # Ensure network exists
+          docker network create pharmacy-network || echo "⚠️ Network may already exist"
+          docker network ls | grep pharmacy-network || echo "⚠️ Network check"
+          
+          # Stop existing containers
+          echo "🛑 Stopping existing containers..."
+          docker-compose down 2>&1 | tee down.log || echo "⚠️ No containers to stop"
+          docker ps -a | grep pharmacy || echo "✅ No existing containers"
+          
+          # Deploy
+          echo "🐳 Building and starting containers..."
+          docker-compose up -d --build 2>&1 | tee build.log
+          echo "✅ Containers started"
+          
+          # Check container status
+          echo "📊 Container Status:"
+          docker-compose ps
+          sleep 5
+          docker ps | grep pharmacy || echo "⚠️ Container check"
+          
+          # Wait for services
+          echo "⏳ Waiting for services to start..."
+          for i in {1..9}; do
+            echo "   Check $i/9..."
+            if docker-compose exec -T db mysqladmin ping -h localhost &>/dev/null; then
+              echo "✅ MySQL is ready"
+              break
+            fi
+            sleep 5
+          done
+          
+          # Laravel setup
+          echo "⚙️  Setting up Laravel..."
+          docker-compose exec -T app composer install --no-dev --optimize-autoloader 2>&1 | tee composer.log || echo "⚠️ Composer install"
+          docker-compose exec -T app php artisan key:generate --force 2>&1 | tee keygen.log || echo "⚠️ Key generate"
+          docker-compose exec -T app php artisan migrate --force 2>&1 | tee migrate.log || echo "⚠️ Migrate"
+          docker-compose exec -T app php artisan db:seed --force 2>&1 | tee seed.log || echo "⚠️ Seed"
+          docker-compose exec -T app php artisan config:cache 2>&1 | tee config-cache.log || echo "⚠️ Config cache"
+          docker-compose exec -T app php artisan route:cache 2>&1 | tee route-cache.log || echo "⚠️ Route cache"
+          docker-compose exec -T app php artisan view:cache 2>&1 | tee view-cache.log || echo "⚠️ View cache"
+          
+          echo "✅ Deployment complete!"
+          
+          # Final status
+          echo "📊 Final Status:"
+          docker-compose ps
+          docker-compose logs --tail=20 app || echo "⚠️ App logs"
+          docker-compose logs --tail=20 nginx || echo "⚠️ Nginx logs"
+
+    - name: 🔍 Health Check
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.EC2_HOST }}
+        username: ${{ secrets.EC2_USER }}
+        key: ${{ secrets.SSH_PRIVATE_KEY }}
+        port: ${{ secrets.EC2_PORT || 22 }}
+        script: |
+          set -x
+          echo "🔍 Running health check..."
+          cd /var/www/pharmacy-backend
+          
+          # Check containers
+          echo "📊 Container Status:"
+          docker-compose ps
+          
+          # Check logs
+          echo "📋 Recent Logs:"
+          docker-compose logs --tail=10 app || echo "⚠️ App logs"
+          
+          # Health check
+          for i in {1..10}; do
+            echo "   Health check attempt $i/10..."
+            RESPONSE=$(curl -f -s http://localhost:8000/api/health || echo "FAILED")
+            if [ "$RESPONSE" != "FAILED" ]; then
+              echo "✅ Health check passed!"
+              echo "Response: $RESPONSE"
+              exit 0
+            fi
+            echo "   Retry in 5 seconds..."
+            sleep 5
+          done
+          
+          echo "❌ Health check failed"
+          echo "📋 Debug Info:"
+          docker-compose ps
+          docker-compose logs --tail=50 app
+          docker-compose logs --tail=50 nginx
+          exit 1
+
+    - name: 🔄 Rollback on Failure
+      if: failure()
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.EC2_HOST }}
+        username: ${{ secrets.EC2_USER }}
+        key: ${{ secrets.SSH_PRIVATE_KEY }}
+        port: ${{ secrets.EC2_PORT || 22 }}
+        script: |
+          set -x
+          echo "🔄 Rolling back to previous version..."
+          cd /var/www/pharmacy-backend
+          
+          echo "📋 Current status:"
+          git log -1 --oneline
+          docker-compose ps
+          
+          echo "🔄 Rolling back..."
+          git reset --hard HEAD~1 || echo "⚠️ Git reset"
+          git log -1 --oneline
+          
+          echo "🐳 Rebuilding..."
+          docker-compose down || true
+          docker-compose up -d --build 2>&1 | tee rollback-build.log
+          
+          sleep 30
+          
+          echo "✅ Rollback complete"
+          docker-compose ps
+          curl -f http://localhost:8000/api/health || echo "⚠️ Health check after rollback"
